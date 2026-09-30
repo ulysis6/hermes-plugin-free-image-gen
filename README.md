@@ -178,6 +178,35 @@ An account without the waiver will either be refused or watermarked anyway. The 
 
 ---
 
+## Where the images are written
+
+Finished images land in your **session's working directory** — the folder Hermes
+is running in (for the desktop app that is usually the project you have open),
+so the file sits next to your work instead of in an opaque cache.
+
+Resolution order:
+
+1. `image_gen.output_dir` (config) — explicit wins
+2. `HERMES_IMAGE_OUTPUT_DIR` (env)
+3. The session working directory (`TERMINAL_CWD`, then the process `cwd`)
+4. `D:\hermes` on Windows, `~` elsewhere
+
+```bash
+hermes config set image_gen.output_dir "D:/my-project/covers"   # pin it
+```
+
+Files are named `<backend>_<YYYYmmdd>_<HHMMSS>_<random>.<ext>` — for example
+`agnes_20260930_204323_4ae6495e.png` — so you can tell at a glance which backend
+made it and which run it belonged to. The extension is sniffed from the file's
+magic bytes, so a JPEG served as `application/octet-stream` still gets `.jpg`
+rather than a lying `.png`.
+
+If the target directory cannot be written to, the image is cached under
+`$HERMES_HOME/cache/images/` instead — you never lose the file to a read-only
+folder.
+
+---
+
 ## Image editing / img2img — Agnes only
 
 **智谱 CogView-3-Flash and Pollinations are text-to-image only** (their adapters report `max_reference_images: 0`). To restyle a picture or redraw it while keeping the composition, only `agnes` can do it — up to 4 reference images:
@@ -217,16 +246,10 @@ Or write it by hand in `config.yaml` (`hermes config path` shows the location):
 image_gen:
   provider: free-any
   free-any:
-    order: [cogview, pollinations, agnes]   # tried left to right
+    order: [agnes, cogview, pollinations]   # tried left to right
 ```
 
-Omit `order` and it defaults to `[cogview, pollinations, agnes]`. Any registered provider name works, including Hermes' own built-ins (e.g. `fal`).
-
-**Order it by reliability, not by preference.** Pollinations (finding 2) both refuses and silently downscales, so it belongs at the end — as a last resort rather than a first try:
-
-```yaml
-    order: [cogview, agnes, pollinations]
-```
+Omit `order` and it defaults to `[agnes, cogview, pollinations]` — best output first, least reliable last (Agnes renders at 2K with no watermark and supports image editing; Pollinations, per finding 2, both refuses and silently downscales). Any registered provider name works, including Hermes' own built-ins (e.g. `fal`).
 
 ### Behaviour
 
@@ -272,7 +295,7 @@ All three advertise "OpenAI-compatible images", and all three mean something dif
 | Agnes | `POST /v1/images/generations` | `size: "2K"` + `ratio: "16:9"` + `extra_body` | `extra_body.image[]` |
 | Pollinations | **`GET`** `/prompt/{text}?width=&height=&model=` | URL query params | not supported |
 
-Pollinations doesn't even return JSON — it returns raw image bytes with no auth header. A single generic request builder cannot cover these; each adapter is ~60 lines and shares the provider plumbing (aspect mapping, magic-byte sniffing for correct file extensions, local caching under `$HERMES_HOME/cache/images/`, uniform error responses).
+Pollinations doesn't even return JSON — it returns raw image bytes with no auth header. A single generic request builder cannot cover these; each adapter is ~60 lines and shares the provider plumbing (aspect mapping, magic-byte sniffing for correct file extensions, writing the finished file into your working directory, uniform error responses).
 
 ## Troubleshooting
 

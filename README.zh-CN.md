@@ -180,6 +180,27 @@ hermes config set image_gen.cogview.watermark_enabled false
 
 ---
 
+## 图片写到哪里
+
+生成的图**直接落在你这次会话的工作目录**里 —— 也就是 Hermes 当前运行所在的那个文件夹（桌面版一般就是你打开的项目目录），图就放在你的工作旁边，而不是藏在某个缓存目录里。
+
+解析顺序：
+
+1. `image_gen.output_dir`（配置）—— 显式指定优先
+2. `HERMES_IMAGE_OUTPUT_DIR`（环境变量）
+3. 会话工作目录（先看 `TERMINAL_CWD`，再看进程 `cwd`）
+4. Windows 下 `D:\hermes`，其它系统 `~`
+
+```bash
+hermes config set image_gen.output_dir "D:/my-project/covers"   # 固定到某处
+```
+
+文件命名是 `<后端>_<年月日>_<时分秒>_<随机>.<扩展名>`，比如 `agnes_20260930_204323_4ae6495e.png` —— 一眼就能看出是谁出的、哪一次出的。扩展名按文件头 magic bytes 嗅探，所以 CDN 拿 `application/octet-stream` 糊弄时（智谱就是这么干的），出图是 JPEG 就会老老实实叫 `.jpg`，不会骗你一个 `.png`。
+
+如果目标目录不可写，图会退回存到 `$HERMES_HOME/cache/images/` —— 只读目录也不会让你丢图。
+
+---
+
 ## 图片编辑 / 图生图 —— 只有 Agnes 支持
 
 **智谱 CogView-3-Flash 和 Pollinations 都是纯文生图**（适配器报 `max_reference_images: 0`）。想要"给一张图改风格 / 保持构图重画"，只有 `agnes` 能做，最多 4 张参考图：
@@ -219,16 +240,10 @@ hermes config set image_gen.free-any.order "[cogview, pollinations, agnes]"
 image_gen:
   provider: free-any
   free-any:
-    order: [cogview, pollinations, agnes]   # 从左到右依次尝试
+    order: [agnes, cogview, pollinations]   # 从左到右依次尝试
 ```
 
-`order` 不配时默认就是 `[cogview, pollinations, agnes]`。名字可以写任意已注册的后端（包括 Hermes 自带的，比如 `fal`）。
-
-**排序按可靠性排，别按喜好排。** Pollinations（见上文第 2 条）既会拒绝也会偷偷缩水，所以应该放最后 —— 当"最后的备胎"，而不是首选：
-
-```yaml
-    order: [cogview, agnes, pollinations]
-```
+`order` 不配时默认就是 `[agnes, cogview, pollinations]` —— **好用的排前面，最不稳的排最后**（agnes 出 2K 无水印、还支持图片编辑；pollinations 见上文第 2 条，既会拒绝也会偷偷缩水）。名字可以写任意已注册的后端（包括 Hermes 自带的，比如 `fal`）。
 
 ### 行为细节
 
@@ -275,7 +290,7 @@ image_gen:
 | Agnes | `POST /v1/images/generations` | `size: "2K"` + `ratio: "16:9"` + `extra_body` | `extra_body.image[]` |
 | Pollinations | **`GET`** `/prompt/{text}?width=&height=&model=` | URL 查询参数 | 不支持 |
 
-Pollinations 甚至连 JSON 都不返回 —— 它直接吐原始图片字节，且不要任何鉴权头。一个通用请求构造器盖不住这些差异；所以每个适配器各约 60 行，共用底层管道（宽高比映射、按 magic bytes 嗅探真实文件扩展名、本地缓存到 `$HERMES_HOME/cache/images/`、统一的错误响应结构）。
+Pollinations 甚至连 JSON 都不返回 —— 它直接吐原始图片字节，且不要任何鉴权头。一个通用请求构造器盖不住这些差异；所以每个适配器各约 60 行，共用底层管道（宽高比映射、按 magic bytes 嗅探真实文件扩展名、把成品图写进你的工作目录、统一的错误响应结构）。
 
 ## 排错
 

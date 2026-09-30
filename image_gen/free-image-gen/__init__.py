@@ -31,8 +31,10 @@ Config (all optional; secrets belong in .env, not here):
 
     image_gen:
       provider: cogview          # or: pollinations | agnes | free-any
+      # output_dir: D:\hermes    # where finished images are written; default is
+      #                          # the session's working directory, else D:\hermes
       free-any:
-        order: [cogview, agnes, pollinations]   # tried left to right, first win
+        order: [agnes, cogview, pollinations]   # tried left to right, first win
       cogview:
         model: cogview-3-flash
         # sizes: {landscape: 1440x720, portrait: 720x1440}
@@ -236,19 +238,87 @@ def _image_dimensions(source: Any) -> Optional[Tuple[int, int]]:
     return None
 
 
-def _save_bytes(data: bytes, prefix: str, content_type: str = "") -> str:
-    """Cache raw image bytes under $HERMES_HOME/cache/images/."""
-    ext = "png"
+DEFAULT_OUTPUT_DIR = r"D:\hermes"
+
+
+def _output_dir() -> str:
+    """Where a finished image is written.
+
+    Hermes' own helpers always drop files in ``$HERMES_HOME/cache/images``. When
+    you generate from a project directory you usually want the file beside your
+    work instead, so resolve in this order:
+
+    1. ``image_gen.output_dir`` (config) — explicit wins
+    2. ``HERMES_IMAGE_OUTPUT_DIR`` (env)
+    3. **the session's working directory** (``TERMINAL_CWD``, then ``os.getcwd()``)
+    4. ``D:\\hermes`` on Windows, ``~`` elsewhere
+    """
+    for candidate in (_first(_image_gen_cfg().get("output_dir")),
+                      _first(os.environ.get("HERMES_IMAGE_OUTPUT_DIR"))):
+        if candidate:
+            try:
+                os.makedirs(candidate, exist_ok=True)
+                return candidate
+            except OSError as exc:
+                logger.warning("image_gen.output_dir %r unusable (%s), falling back", candidate, exc)
+
+    for candidate in (_first(os.environ.get("TERMINAL_CWD")), os.getcwd()):
+        if candidate and os.path.isdir(candidate):
+            return candidate
+
+    fallback = DEFAULT_OUTPUT_DIR if os.name == "nt" else os.path.expanduser("~")
+    try:
+        os.makedirs(fallback, exist_ok=True)
+    except OSError:
+        pass
+    return fallback
+
+
+def _sniff_ext(data: bytes, content_type: str = "", hint: str = "") -> str:
+    """File extension from the magic bytes first, then Content-Type, then a hint."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if data[:2] == b"\xff\xd8":
+        return "jpg"
+    if data[:6] in (b"GIF87a", b"GIF89a") or data[:4] == b"GIF8":
+        return "gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
     ct = (content_type or "").split(";", 1)[0].strip().lower()
     if ct in ("image/jpeg", "image/jpg"):
-        ext = "jpg"
-    elif ct == "image/webp":
-        ext = "webp"
-    elif ct == "image/gif":
-        ext = "gif"
-    elif data[:2] == b"\xff\xd8":
-        ext = "jpg"
-    return str(save_b64_image(base64.b64encode(data).decode(), prefix=prefix, extension=ext))
+        return "jpg"
+    if ct == "image/webp":
+        return "webp"
+    if ct == "image/gif":
+        return "gif"
+    if ct == "image/png":
+        return "png"
+    return (hint or "png").lstrip(".").lower() or "png"
+
+
+def _write_image(data: bytes, prefix: str, content_type: str = "", hint: str = "") -> str:
+    """Write image bytes into :func:`_output_dir` and return the absolute path.
+
+    Falls back to Hermes' own cache helper only if the target directory cannot
+    be written to, so a read-only working directory never costs you the image.
+    """
+    import time
+
+    ext = _sniff_ext(data, content_type, hint)
+    name = "%s_%s_%s.%s" % (prefix, time.strftime("%Y%m%d_%H%M%S"), os.urandom(4).hex(), ext)
+    target = os.path.join(_output_dir(), name)
+    try:
+        with open(target, "wb") as fh:
+            fh.write(data)
+        return target
+    except OSError as exc:
+        logger.warning("could not write %s (%s); caching under HERMES_HOME instead", target, exc)
+        return str(save_b64_image(base64.b64encode(data).decode(), prefix=prefix, extension=ext))
+
+
+def _save_bytes(data: bytes, prefix: str, content_type: str = "") -> str:
+    """Persist raw image bytes (see :func:`_write_image` for the target dir)."""
+    return _write_image(data, prefix, content_type)
 
 
 _DATA_URI_MIME = {
@@ -840,7 +910,7 @@ class AgnesProvider(ImageGenProvider):
 
         if b64:
             try:
-                image = str(save_b64_image(b64, prefix=self.name, extension="png"))
+                image = _save_bytes(base64.b64decode(b64), self.name, "image/png")
             except Exception as exc:
                 return error_response(error=f"Could not save Agnes b64 image: {exc}",
                                       error_type="io_error", provider=self.name,
@@ -874,6 +944,31 @@ class AgnesProvider(ImageGenProvider):
 # ---------------------------------------------------------------------------
 
 
+def _provider_knows_model(provider: Any, model_id: str) -> bool:
+    """Does ``provider`` list ``model_id``?
+
+    Used by the ``free-any`` chain so a model configured for one backend is not
+    forced onto another. A provider that publishes no model list (or whose list
+    cannot be read) is treated as "yes" — never second-guess a backend we cannot
+    interrogate; it will surface a clear error if the name really is wrong.
+    """
+    try:
+        models = provider.list_models() or []
+    except Exception:
+        return True
+    ids = set()
+    for entry in models:
+        if isinstance(entry, dict):
+            candidate = entry.get("id") or entry.get("name") or entry.get("model")
+        else:
+            candidate = entry
+        if isinstance(candidate, str) and candidate.strip():
+            ids.add(candidate.strip().lower())
+    if not ids:
+        return True
+    return model_id.strip().lower() in ids
+
+
 class FreeAnyProvider(ImageGenProvider):
     """Try several backends in order and return the first image that works.
 
@@ -891,15 +986,20 @@ class FreeAnyProvider(ImageGenProvider):
 
     Names are tried left to right. Backends that are unregistered, missing
     credentials, or that raise/return an error are skipped and recorded in the
-    response's ``attempts`` list. An explicitly passed ``model`` is forwarded to
-    every backend — a name only one of them understands still works, because the
-    others reject it and the chain moves on.
+    response's ``attempts`` list.
+
+    A ``model`` is only forwarded to backends that actually list it: a name set
+    for one provider (say ``cogview-3-flash``) is dropped for the others, which
+    then use their own default. Without that, whichever backend sits first in
+    the chain would fail on a foreign model name and you would silently lose the
+    ordering you configured. Skipped names are noted in ``attempts``.
     """
 
-    # Reliability-ordered, not preference-ordered: 智谱 is the durable free tier,
-    # Agnes is a promo that currently works, and Pollinations both refuses (402)
-    # and silently downscales, so it is the last resort rather than the first try.
-    DEFAULT_ORDER = ("cogview", "agnes", "pollinations")
+    # Default chain: highest quality first, least reliable last.
+    #   agnes       — best output (2K, no watermark, supports image editing)
+    #   cogview     — the durable free tier (official "free model", watermarked)
+    #   pollinations— refuses and silently downscales, so it is the last resort
+    DEFAULT_ORDER = ("agnes", "cogview", "pollinations")
 
     @property
     def name(self) -> str:
@@ -1077,8 +1177,22 @@ class FreeAnyProvider(ImageGenProvider):
                 continue
 
             try:
+                backend_kwargs = dict(kwargs)
+                wanted = backend_kwargs.get("model")
+                if wanted and not _provider_knows_model(provider, wanted):
+                    # A model name set for one backend must not be forced onto
+                    # another — Agnes asked for "cogview-3-flash" just fails and
+                    # burns a slot. Drop it here so this backend uses its own
+                    # default instead of erroring out.
+                    backend_kwargs.pop("model", None)
+                    note = "ignored model %r (not in its model list); used its default" % (wanted,)
+                    logger.info("free-any: %s %s", backend, note)
+                else:
+                    note = None
                 result = provider.generate(prompt, aspect, image_url=image_url,
-                                           reference_image_urls=reference_image_urls, **kwargs)
+                                           reference_image_urls=reference_image_urls, **backend_kwargs)
+                if note:
+                    attempts.append({"provider": backend, "note": note})
             except Exception as exc:
                 attempts.append({"provider": backend,
                                  "error": "%s: %s" % (type(exc).__name__, exc)})
@@ -1089,13 +1203,14 @@ class FreeAnyProvider(ImageGenProvider):
                 # Pass the winning backend's response through untouched apart
                 # from chain bookkeeping, so ``provider`` keeps naming the
                 # backend that actually produced the image.
+                failures = sum(1 for a in attempts if "error" in a or "skipped" in a)
                 result["requested_provider"] = self.name
                 result["chain"] = list(chain)
                 result["attempts"] = attempts + [{"provider": backend, "ok": True}]
-                result["fallbacks_used"] = len(attempts)
-                if attempts:
+                result["fallbacks_used"] = failures
+                if failures:
                     logger.info("free-any: served by '%s' after %d failed backend(s)",
-                                backend, len(attempts))
+                                backend, failures)
                 return result
 
             detail = result.get("error") if isinstance(result, dict) else repr(result)
