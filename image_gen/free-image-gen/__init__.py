@@ -68,6 +68,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import re
 import struct
 import urllib.parse
 from typing import Any, Dict, List, Optional, Tuple
@@ -248,6 +249,53 @@ def _save_bytes(data: bytes, prefix: str, content_type: str = "") -> str:
     elif data[:2] == b"\xff\xd8":
         ext = "jpg"
     return str(save_b64_image(base64.b64encode(data).decode(), prefix=prefix, extension=ext))
+
+
+_DATA_URI_MIME = {
+    b"\x89PNG\r\n\x1a\n": "image/png",
+    b"\xff\xd8": "image/jpeg",
+    b"GIF8": "image/gif",
+}
+
+
+def _as_data_uri(src: str) -> str:
+    """Normalise an image reference for APIs that want inline base64.
+
+    Agnes (and most OpenAI-compatible editors) expect ``extra_body.image`` to
+    hold **data URIs or http(s) URLs** — sending a bare local path gets back
+    ``"extra_body.image is not a valid image base64"``. Hermes hands providers
+    local file paths, so convert those here.
+
+    ``http(s)://`` and existing ``data:`` URIs pass through untouched; a
+    ``file://`` URL or plain path is read off disk and encoded.
+    """
+    if not isinstance(src, str):
+        return src
+    s = src.strip()
+    if not s:
+        return s
+    low = s.lower()
+    if low.startswith(("data:", "http://", "https://")):
+        return s
+    if low.startswith("file://"):
+        s = urllib.parse.unquote(s[7:])
+        if re.match(r"^/[A-Za-z]:", s):        # file:///C:/x -> C:/x
+            s = s[1:]
+    if not os.path.isfile(s):
+        return src                              # not a file we can read; let the API judge
+
+    with open(s, "rb") as fh:
+        raw = fh.read()
+    mime = "image/png"
+    for magic, guess in _DATA_URI_MIME.items():
+        if raw.startswith(magic):
+            mime = guess
+            break
+    else:
+        ext = os.path.splitext(s)[1].lower()
+        mime = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
+                ".gif": "image/gif", ".png": "image/png"}.get(ext, "image/png")
+    return "data:%s;base64,%s" % (mime, base64.b64encode(raw).decode("ascii"))
 
 
 def _cache_image_url(url: str, prefix: str) -> str:
@@ -718,7 +766,8 @@ class AgnesProvider(ImageGenProvider):
         if isinstance(image_url, str) and image_url.strip():
             sources.append(image_url.strip())
         sources.extend(normalize_reference_images(reference_image_urls) or [])
-        sources = sources[:4]
+        # Agnes wants data URIs or http(s) URLs, never a bare local path.
+        sources = [_as_data_uri(s) for s in sources[:4]]
         modality = "image" if sources else "text"
 
         # Canvas, part 1 — the size tier: per-aspect override > one pinned tier >

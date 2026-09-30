@@ -21,12 +21,13 @@ Pick one with `image_gen.provider` in `config.yaml`. Verified working end-to-end
 
 These were measured, not copied from marketing pages. Three findings matter:
 
-**1. Both free backends stamp a watermark in the bottom-right corner.**
+**1. Two of the three stamp a watermark in the bottom-right corner — Agnes does not.**
 
-- **智谱 CogView-3-Flash** → a dark rounded pill reading **「AI生成」**
+- **智谱 CogView-3-Flash** → a dark rounded pill reading **「AI生成」** (the file lands in 智谱's `maas-**watermark**-prod-new...` CDN bucket, which is the tell)
 - **Pollinations** → a **`pollinations.ai`** logo + text (its `nologo=true` parameter did not suppress it when tested)
+- **Agnes** → **clean, no watermark** (verified on both text-to-image and image-editing output)
 
-The file lives in 智谱's `maas-**watermark**-prod-new...` CDN bucket, which is the tell. If you generate blog covers or thumbnails with a design that reserves the bottom-right (e.g. for an avatar), **the watermark will land on top of it.** Crop downstream, or use this backend only for base art.
+If you generate blog covers or thumbnails with a design that reserves the bottom-right (e.g. for an avatar), **智谱's and Pollinations' watermarks will land on top of it.** Crop downstream, or reach for `agnes` when the corner has to stay empty.
 
 **2. Pollinations is much narrower than it looks, and its refusal rule is not stable — this is the important one.**
 
@@ -151,7 +152,7 @@ Dotted paths write straight into nested maps — `hermes config set image_gen.co
 | Backend | Its canvas vocabulary | Default per aspect (landscape / square / portrait) |
 |---|---|---|
 | `cogview` 智谱 | **7 documented enum values**: `1024x1024` `768x1344` `864x1152` `1344x768` `1152x864` `1440x720` `720x1440`; custom values allowed (each side 512–2048px, divisible by 16, ≤ 2²¹ px total) | `1344x768` / `1024x1024` / `768x1344` |
-| `agnes` | **size tier + ratio**: tier `1K`/`2K`/`3K`/`4K`, ratio its own vocabulary (`16:9`, `1:1`, `9:16`, …) — **real non-square output** | `2K`+`16:9` / `2K`+`1:1` / `2K`+`9:16` |
+| `agnes` | **size tier + ratio**: tier `1K`/`2K`/`3K`/`4K`, ratio its own vocabulary (`16:9`, `1:1`, `9:16`, …) — **real non-square output at 2K+** | `2K`+`16:9` → **2624x1472**, `2K`+`1:1` → **2048x2048**, `2K`+`9:16` → **1472x2624** (all measured) |
 | `pollinations` | accepts any `WxH` but **only sometimes honours it** — refusals (402) and silent downscales both happen (finding 2); **no guaranteed shape or availability** | `1024x576` / `1024x1024` / `576x1024` (the 16:9 pair + square) |
 
 **Responses state what actually came out:**
@@ -174,6 +175,24 @@ hermes config set image_gen.cogview.watermark_enabled false
 ```
 
 An account without the waiver will either be refused or watermarked anyway. The parameter is **not sent by default**, so leaving it alone changes nothing.
+
+---
+
+## Image editing / img2img — Agnes only
+
+**智谱 CogView-3-Flash and Pollinations are text-to-image only** (their adapters report `max_reference_images: 0`). To restyle a picture or redraw it while keeping the composition, only `agnes` can do it — up to 4 reference images:
+
+```python
+# Hermes passes local paths in; the adapter converts them to the data URIs Agnes wants
+generate(prompt, aspect_ratio, image_url="C:/path/to/source.png")
+generate(prompt, aspect_ratio, reference_image_urls=["a.png", "b.png"])
+```
+
+**Measured:** given a 2624x1472 photo of a coffee cup plus "convert to a black-and-white pencil sketch, keep the composition", Agnes kept the original layout (wooden table, both windows, chair all in place) and produced a sketch.
+
+> **Pitfall, fixed in v1.3.0:** Agnes' `extra_body.image` accepts **only data URIs or http(s) URLs** — a bare local path fails with `extra_body.image is not a valid image base64`. The adapter now reads the file, sniffs its type and sends `data:image/png;base64,...`.
+
+---
 
 ## `free-any` — the auto-fallback backend
 

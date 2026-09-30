@@ -21,12 +21,13 @@ Hermes 自带八个生图后端（`openai`、`xai`、`fal`、`krea`、`deepinfra
 
 这些是实测出来的，不是抄的宣传页。三条很要紧：
 
-**1. 两个免费后端都会在右下角盖水印。**
+**1. 三个后端里有两个会在右下角盖水印 —— Agnes 不盖。**
 
-- **智谱 CogView-3-Flash** → 深色圆角胶囊，内容 **「AI生成」**
-- **Pollinations** → **`pollinations.ai`** logo + 文字（它那个 `nologo=true` 参数实测压不掉）
+- **智谱 CogView-3-Flash** → 一个深色圆角胶囊，写着 **「AI生成」**（判断依据：图片文件落在智谱 `maas-**watermark**-prod-new...` 这个 CDN 桶里，名字就写着 watermark）
+- **Pollinations** → **`pollinations.ai`** logo + 文字（实测它自己的 `nologo=true` 参数压不住）
+- **Agnes** → **干净无水印**（文生图和图片编辑两种模式都实测确认过）
 
-判断依据：图片文件落在智谱的 `maas-**watermark**-prod-new...` CDN 桶里，名字就写着 watermark。如果你拿它做博客封面或缩略图，且设计上右下角要留位置（比如放头像），**水印正好压在你的留白上**。要么后期裁掉，要么只用它出底图。
+如果你拿它做博客封面或缩略图，且设计上右下角要留位置（比如放头像），**智谱和 Pollinations 的水印正好压在你的留白上**。要么后期裁掉，要么在这种"右下角必须干净"的场景改用 `agnes`。
 
 **2. Pollinations 比看起来窄得多，而且它的拒绝规则不稳定 —— 这是最要紧的一条。**
 
@@ -153,7 +154,7 @@ hermes config set image_gen.agnes.ratios.landscape 4:3
 | 后端 | 该模型支持什么 | 默认映射（landscape / square / portrait） |
 |---|---|---|
 | `cogview` 智谱 | **7 种官方枚举**：`1024x1024` `768x1344` `864x1152` `1344x768` `1152x864` `1440x720` `720x1440`；也收自定义（每边 512–2048px、能被 16 整除、总像素 ≤ 2²¹） | `1344x768` / `1024x1024` / `768x1344` |
-| `agnes` | **尺寸档 + 比例**两段式：档位 `1K`/`2K`/`3K`/`4K`，比例自成一套（16:9、1:1、9:16…）—— **支持真正的非方形** | `2K`+`16:9` / `2K`+`1:1` / `2K`+`9:16` |
+| `agnes` | **尺寸档 + 比例**两段式：档位 `1K`/`2K`/`3K`/`4K`，比例自成一套（16:9、1:1、9:16…）—— **2K 及以上支持真正的非方形** | `2K`+`16:9` → **2624x1472**，`2K`+`1:1` → **2048x2048**，`2K`+`9:16` → **1472x2624**（均为实测值） |
 | `pollinations` | 接受任意 `宽x高`，但**只是有时照做** —— 既会 402 拒绝，也会偷偷缩水（见上文第 2 条）；**形状和可用性都没有保证** | `1024x576` / `1024x1024` / `576x1024`（16:9 一对 + 方形） |
 
 **响应里会如实告诉你实际出了什么：**
@@ -176,6 +177,22 @@ hermes config set image_gen.cogview.watermark_enabled false
 ```
 
 没签的账号智谱会拒绝或照样带水印。默认**不发送**这个参数，所以不配就等于保持原样。
+
+---
+
+## 图片编辑 / 图生图 —— 只有 Agnes 支持
+
+**智谱 CogView-3-Flash 和 Pollinations 都是纯文生图**（适配器报 `max_reference_images: 0`）。想要"给一张图改风格 / 保持构图重画"，只有 `agnes` 能做，最多 4 张参考图：
+
+```python
+# Hermes 会把本地路径传进来；插件负责转成 Agnes 要的 base64 data URI
+generate(prompt, aspect_ratio, image_url="C:/path/to/source.png")
+generate(prompt, aspect_ratio, reference_image_urls=["a.png", "b.png"])
+```
+
+**实测**：拿一张 2624×1472 的咖啡杯照片 + 提示词"转成黑白铅笔素描、保持构图"，Agnes 保留了原图的构图（木桌、两只窗户、木椅位置都没变）并成功转成素描风格。
+
+> **踩过的坑（已在 v1.3.0 修掉）**：Agnes 的 `extra_body.image` **只接受 data URI 或 http(s) URL**，直接传本地路径会报 `extra_body.image is not a valid image base64`。插件现在会自动读文件、嗅探类型、编码成 `data:image/png;base64,...` 再发。
 
 ---
 
@@ -267,7 +284,7 @@ Pollinations 甚至连 JSON 都不返回 —— 它直接吐原始图片字节�
 | `ZHIPU_API_KEY not set` | Key 不在 `~/.hermes/.env` 里。加上，**新开会话**。 |
 | `智谱 returned HTTP 401` | Key 错或过期。去 bigmodel.cn 重新生成。 |
 | `智谱 returned HTTP 429` | 触发限速或额度用尽。**换成 `free-any`**，让它自动兜到下一个。 |
-| `Pollinations returned 402` | 你要了付费模型。免费的只有 `sana`。 |
+| `Pollinations 返回 402` | 两种原因：画布非方形（或小于 1024px）—— 免费档只稳出 1:1；或者匿名额度被限流。空 `{}` 响应体意味着"拒绝"，不等于"收费"。改成方形重试，或者这个 16:9 换别的后端出。 |
 | Pollinations 返回 HTML/JSON 而不是图片 | 上游偶发错误，重试。适配器会拒绝非 `image/*` 响应，不会把垃圾存成文件。 |
 | 工具报"没有可用的生图 provider" | `image_gen.provider` 不是 `cogview`/`pollinations`/`agnes`/`free-any` 之一，或插件不在 `plugins.enabled` 里。 |
 | `free-any has no usable backend` | `image_gen.free-any.order` 里的名字一个都没注册上（拼错 / 对应插件没启用）。 |
