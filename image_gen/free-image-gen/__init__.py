@@ -5,8 +5,17 @@ Provider ids registered by this plugin:
 * ``cogview``      — 智谱 CogView-3-Flash (permanently free model, official docs)
 * ``pollinations`` — Pollinations (no API key at all)
 * ``agnes``        — Agnes AI (agnes-image-2.x-flash, promotional $0)
+* ``free-any``     — meta backend: tries the above in order, first success wins
 
 Pick one with ``image_gen.provider`` in config.yaml.
+
+``free-any`` exists because Hermes activates exactly ONE provider and never
+falls back on failure: ``get_active_provider()`` returns the configured backend
+even when it is unavailable, deliberately preferring "a precise error message
+over a silent backend switch". So a 429, a 402, or a burned free quota on the
+active backend is a hard failure. The meta backend restores that fallback by
+re-dispatching to the other registered providers itself, in a configurable
+order, until one returns an image.
 
 Why one plugin with three adapters: these backends all advertise "free images"
 but their request shapes have nothing in common —
@@ -21,20 +30,35 @@ mapping, local image caching, error wrapping) is shared.
 Config (all optional; secrets belong in .env, not here):
 
     image_gen:
-      provider: cogview          # or: pollinations | agnes
+      provider: cogview          # or: pollinations | agnes | free-any
+      free-any:
+        order: [cogview, agnes, pollinations]   # tried left to right, first win
       cogview:
         model: cogview-3-flash
-        # size: "1344x768"       # optional: force ONE canvas for every request
+        # sizes: {landscape: 1440x720, portrait: 720x1440}
+        # size: "1344x768"         # one canvas for every aspect
+        # watermark_enabled: false # needs 智谱's waiver; drops the AI生成 pill
       agnes:
         base_url: https://apihub.agnes-ai.com/v1
-        # size: "2K"             # 1K | 2K | 3K | 4K
+        # sizes: {landscape: 4K}   # size tier: 1K | 2K | 3K | 4K
+        # ratios: {landscape: 4:3} # Agnes' own ratio vocabulary
       pollinations:
         model: sana
 
-The canvas is derived from the requested ``aspect_ratio``:
-landscape → 16:9-ish, square → 1:1, portrait → 9:16-ish. There is deliberately
-no global ``image_gen.size`` override — one shared value would flatten
-landscape and portrait into the same canvas.
+Canvas precedence, most specific first — identical for every backend:
+
+    1. ``image_gen.<backend>.sizes.<aspect>``  per-aspect, e.g. {landscape: 1440x720}
+    2. ``image_gen.<backend>.size``            one canvas for all three aspects
+    3. the adapter's default for that aspect   (the set that model supports)
+
+Each adapter's default is what its model can actually produce, not a house
+preference: 智谱 exposes 7 documented canvases, Agnes takes a size tier plus a
+ratio, and Pollinations may refuse (402) or quietly downscale whatever it is
+asked for. A global ``image_gen.size`` is deliberately NOT honoured — one shared
+value would flatten landscape and portrait into the same canvas, which is the
+whole reason the per-aspect key exists. Every response reports the canvas read
+back out of the finished image alongside ``aspect_ratio_honored``, so "this model
+can't do 16:9" is distinguishable from "you asked it for 4:3".
 
 Environment variables: ``ZHIPU_API_KEY``, ``AGNES_API_KEY``.
 """
@@ -44,8 +68,9 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import struct
 import urllib.parse
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.secret_scope import get_secret
 from agent.image_gen_provider import (
@@ -65,8 +90,22 @@ REQUEST_TIMEOUT = 180.0
 # Hermes normalises aspect_ratio to landscape|square|portrait.
 _RATIO = {"landscape": "16:9", "square": "1:1", "portrait": "9:16"}
 
-# 智谱 CogView-3-Flash supported canvases (per official docs). 1344x768 is the
-# closest to 16:9 and 768x1344 to 9:16.
+# 智谱's documented enum for every model other than ``glm-image`` —
+# cogview-3-flash included (docs.bigmodel.cn → 图像生成 → ``size``):
+#
+#   1024x1024 (default), 768x1344, 864x1152, 1344x768, 1152x864, 1440x720, 720x1440
+#
+# Custom values are accepted too, but each side must be 512-2048, divisible by
+# 16, and the total must stay under 2**21 pixels (2,097,152). Anything else is
+# refused by the API, which is why the defaults below stick to the enum.
+COGVIEW_CANVASES = ("1024x1024", "768x1344", "864x1152", "1344x768",
+                    "1152x864", "1440x720", "720x1440")
+
+# Closest *documented* canvas per Hermes aspect: 1344x768 is the landscape one
+# (1.75:1, the nearest the enum gets to 16:9), 768x1344 its portrait twin, and
+# 1024x1024 is 智谱's own default. Override per aspect with
+# ``image_gen.cogview.sizes.<aspect>``, or pin one canvas for all three with
+# ``image_gen.cogview.size``.
 _COGVIEW_SIZES = {
     "landscape": "1344x768",
     "square": "1024x1024",
@@ -98,6 +137,101 @@ def _first(*candidates: Any) -> Optional[str]:
     for c in candidates:
         if isinstance(c, str) and c.strip():
             return c.strip()
+    return None
+
+
+# Hermes normalises aspect_ratio to landscape|square|portrait. These are the
+# shapes those names *ask* for; an adapter may not be able to deliver them.
+_TARGET_RATIO = {"landscape": 16 / 9, "square": 1.0, "portrait": 9 / 16}
+
+
+def _canvas_from_cfg(backend: str, aspect: str) -> Optional[str]:
+    """Return the user's canvas override for *backend* + *aspect*, or None.
+
+    Precedence, most specific first::
+
+        image_gen:
+          <backend>:
+            sizes:                       # per-aspect (recommended)
+              landscape: 1440x720
+              portrait: 720x1440
+            size: 1024x1024              # one canvas for every aspect
+
+    The value is in the backend's own notation — ``1344x768`` for 智谱 and
+    Pollinations, ``2K`` for Agnes — because it is passed through verbatim.
+    """
+    sub = _sub_cfg(backend)
+    sizes = sub.get("sizes")
+    if isinstance(sizes, dict):
+        value = sizes.get(aspect)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return _first(sub.get("size"))
+
+
+def _ratio_honored(canvas: str, aspect: str) -> bool:
+    """Does *canvas* actually match the shape *aspect* asked for?
+
+    Accepts either notation an adapter deals in — ``1344x768`` or ``16:9``.
+    A bare tier such as ``2K`` carries no shape information, so it is reported
+    as honoured rather than guessed at. Tolerance is loose because the honest
+    answer for e.g. 智谱's 1344x768 (1.75:1) against a 16:9 ask (1.78:1) is
+    "yes, near enough" — while Pollinations' forced 1:1 is plainly "no".
+    """
+    target = _TARGET_RATIO.get(aspect, 1.0)
+    try:
+        text = (canvas or "").strip().lower()
+        if "x" in text:
+            w, h = (float(v) for v in text.split("x", 1))
+        elif ":" in text:
+            w, h = (float(v) for v in text.split(":", 1))
+        else:
+            return True
+        if h <= 0 or w <= 0:
+            return True
+        return abs((w / h) - target) <= 0.06
+    except Exception:
+        return True
+
+
+def _image_dimensions(source: Any) -> Optional[Tuple[int, int]]:
+    """``(width, height)`` of a PNG or JPEG — from raw bytes or a local path.
+
+    Read from the image itself rather than reported from the request, because
+    the request is not always honoured: Pollinations accepts
+    ``width=1024&height=1024`` and then hands back a **768x768** file. A
+    ``canvas`` field copied from what we asked for would be a lie.
+    """
+    try:
+        if isinstance(source, (bytes, bytearray)):
+            data = bytes(source)
+        elif isinstance(source, str) and os.path.exists(source):
+            with open(source, "rb") as fh:
+                data = fh.read(65536)
+        else:
+            return None
+
+        if data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) >= 24:
+            return struct.unpack(">II", data[16:24])
+
+        if data[:2] == b"\xff\xd8":  # JPEG: walk to the SOFn frame header
+            i = 2
+            while i < len(data) - 9:
+                if data[i] != 0xFF:
+                    i += 1
+                    continue
+                marker = data[i + 1]
+                if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                              0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                    height = int.from_bytes(data[i + 5:i + 7], "big")
+                    width = int.from_bytes(data[i + 7:i + 9], "big")
+                    return (width, height)
+                segment = int.from_bytes(data[i + 2:i + 4], "big")
+                if segment <= 0:
+                    break
+                i += 2 + segment
+    except Exception as exc:  # pragma: no cover
+        logger.debug("Could not read image dimensions: %s", exc)
     return None
 
 
@@ -184,7 +318,8 @@ class CogViewProvider(ImageGenProvider):
         return {
             "name": "智谱 CogView-3-Flash",
             "badge": "free",
-            "tag": "官方免费文生图模型，1024x1024 等 7 种分辨率（注意：出图带 AI生成 水印）",
+            "tag": "官方免费文生图模型，7 种官方画布：" + " / ".join(COGVIEW_CANVASES)
+                   + "（默认带 AI生成 水印，可配 watermark_enabled: false 关闭）",
             "env_vars": [
                 {
                     "key": "ZHIPU_API_KEY",
@@ -229,16 +364,27 @@ class CogViewProvider(ImageGenProvider):
             return error_response(error="requests not installed", error_type="missing_dependency",
                                   provider=self.name, model=model_id, prompt=prompt, aspect_ratio=aspect)
 
-        # Explicit WxH wins; otherwise map the Hermes aspect onto a supported canvas.
-        # Only the per-provider key is honoured here — a global image_gen.size
-        # would silently flatten landscape/portrait into one canvas.
-        explicit = _first(_sub_cfg("cogview").get("size"))
-        if explicit and "x" in explicit:
-            size = explicit
-        else:
-            size = _COGVIEW_SIZES.get(aspect, "1024x1024")
+        # Canvas: per-aspect override > one pinned canvas > this model's own
+        # default for that aspect. A global image_gen.size is deliberately NOT
+        # honoured — one shared value would flatten landscape and portrait into
+        # the same canvas, which is exactly what the per-aspect key exists to
+        # avoid.
+        override = _canvas_from_cfg("cogview", aspect)
+        size = override if (override and "x" in override) \
+            else _COGVIEW_SIZES.get(aspect, "1024x1024")
 
         body: Dict[str, Any] = {"model": model_id, "prompt": prompt, "size": size}
+
+        # 智谱 documents watermark_enabled on this endpoint: false drops both the
+        # visible 「AI生成」 pill and the invisible watermark — but only for accounts
+        # that signed the waiver (个人中心 → 安全管理 → 去水印管理). Sent only when
+        # explicitly disabled, so the default request shape is unchanged.
+        wm = _sub_cfg("cogview").get("watermark_enabled")
+        watermark = True
+        if wm is False or (isinstance(wm, str)
+                           and wm.strip().lower() in ("false", "0", "no", "off")):
+            watermark = False
+            body["watermark_enabled"] = False
 
         try:
             resp = requests.post(
@@ -278,10 +424,20 @@ class CogViewProvider(ImageGenProvider):
             logger.warning("Could not cache 智谱 image locally: %s", exc)
             image = url
 
-        return success_response(image=image, model=model_id, prompt=prompt,
-                                aspect_ratio=aspect, provider=self.name, modality="text",
-                                extra={"size": size, "request_id": payload.get("request_id"),
-                                       "watermark": True})
+        # Trust the file over the request and report the canvas that really landed.
+        actual = _image_dimensions(image) if isinstance(image, str) else None
+        canvas = "%dx%d" % actual if actual else size
+
+        return success_response(
+            image=image, model=model_id, prompt=prompt,
+            aspect_ratio=aspect, provider=self.name, modality="text",
+            extra={"canvas": canvas,
+                   "requested_canvas": size,
+                   "canvas_source": "config" if override else "default",
+                   "aspect_ratio_honored": _ratio_honored(canvas, aspect),
+                   "watermark": watermark,
+                   "request_id": payload.get("request_id"),
+                   "supported_canvases": list(COGVIEW_CANVASES)})
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +449,28 @@ class PollinationsProvider(ImageGenProvider):
     """Pollinations: GET-only, no auth, currently one free model (``sana``)."""
 
     TEMPLATE = "https://image.pollinations.ai/prompt/{prompt}"
+
+    # What canvas to *ask* for, per Hermes aspect: the 16:9 pair for landscape
+    # and portrait, square for square. These are requests, not guarantees.
+    #
+    # Measured 2026-09 — and the rule is NOT stable, which is itself the finding:
+    #
+    #   run A (13 requests, 2s apart)  1024x1024 / 1280x1280 / 1440x1440 -> 200
+    #                                  512x512 / 640x640 / 768x768      -> 402
+    #                                  every non-square                 -> 402
+    #   run B (minutes later)          1280x720 -> 200, delivering 1024x576
+    #   run C (minutes after that)     everything -> 402, square included
+    #
+    # So a 402 with an empty "{}" body is this tier's *generic* refusal, covering
+    # at least three causes we could not fully separate: canvas under 1024px,
+    # non-square canvas, and a throttled/exhausted anonymous quota. Never treat it
+    # as a stable size rule — always fall back. What actually came out is read
+    # back out of the image bytes, because the request is not always honoured
+    # either (1024x1024 came back 768x768 in one run).
     SIZE_PX = {"landscape": (1024, 576), "square": (1024, 1024), "portrait": (576, 1024)}
+
+    # The canvas the free tier is known to accept; also the 402 retry target.
+    SQUARE = (1024, 1024)
 
     @property
     def name(self) -> str:
@@ -356,21 +533,56 @@ class PollinationsProvider(ImageGenProvider):
             return error_response(error="requests not installed", error_type="missing_dependency",
                                   provider=self.name, model=model_id, prompt=prompt, aspect_ratio=aspect)
 
-        w, h = self.SIZE_PX.get(aspect, (1024, 1024))
-        url = (self.TEMPLATE.format(prompt=urllib.parse.quote(prompt, safe=""))
-               + "?width=%d&height=%d&model=%s&nologo=true" % (w, h, urllib.parse.quote(model_id)))
+        def _fetch(cw: int, ch: int):
+            u = (self.TEMPLATE.format(prompt=urllib.parse.quote(prompt, safe=""))
+                 + "?width=%d&height=%d&model=%s&nologo=true"
+                 % (cw, ch, urllib.parse.quote(model_id)))
+            return requests.get(u, timeout=REQUEST_TIMEOUT)
+
+        # Canvas: per-aspect override > one pinned canvas > this model's default.
+        # The default is square for every aspect because that is genuinely all the
+        # free tier serves — a model capability, not a preference of ours.
+        override = _canvas_from_cfg("pollinations", aspect)
+        w, h = self.SIZE_PX.get(aspect, self.SQUARE)
+        if override and "x" in override.lower():
+            try:
+                ow, oh = (int(v) for v in override.lower().split("x", 1))
+                if ow > 0 and oh > 0:
+                    w, h = ow, oh
+                else:
+                    logger.debug("Pollinations: ignoring non-positive size %r", override)
+            except ValueError:
+                logger.debug("Pollinations: ignoring unparsable size %r", override)
+        requested = (w, h)
 
         try:
-            resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+            resp = _fetch(w, h)
         except Exception as exc:
             return error_response(error=f"Request to Pollinations failed: {exc}",
                                   error_type=type(exc).__name__, provider=self.name,
                                   model=model_id, prompt=prompt, aspect_ratio=aspect)
 
+        downgraded = False
+        if resp.status_code == 402 and (w, h) != self.SQUARE:
+            # The free tier refuses anything that is not 1:1 >= 1024. Retry once
+            # on the known-free canvas so the caller gets an image plus an
+            # explicit downgrade flag instead of a bare failure.
+            logger.warning("Pollinations 402 for %dx%d; retrying at %dx%d",
+                           w, h, self.SQUARE[0], self.SQUARE[1])
+            retry = None
+            try:
+                retry = _fetch(*self.SQUARE)
+            except Exception as exc:
+                logger.warning("Pollinations square retry failed: %s", exc)
+            if retry is not None and retry.status_code == 200:
+                resp, w, h, downgraded = retry, self.SQUARE[0], self.SQUARE[1], True
+
         if resp.status_code == 402:
             return error_response(
-                error=("Pollinations returned 402 for model '%s' — that model is paid now. "
-                       "Only 'sana' is free." % model_id),
+                error=("Pollinations returned 402 for %dx%d (model '%s'). The free tier serves "
+                       "1:1 canvases of at least 1024px ONLY — any non-square or sub-1024 request "
+                       "is refused with an empty '{}' body. Retry a square canvas, or use a "
+                       "different backend for 16:9 / 9:16 output." % (w, h, model_id)),
                 error_type="payment_required", provider=self.name,
                 model=model_id, prompt=prompt, aspect_ratio=aspect)
         if resp.status_code != 200:
@@ -391,9 +603,25 @@ class PollinationsProvider(ImageGenProvider):
                                   error_type="io_error", provider=self.name,
                                   model=model_id, prompt=prompt, aspect_ratio=aspect)
 
-        return success_response(image=image, model=model_id, prompt=prompt, aspect_ratio=aspect,
-                                provider=self.name, modality="text",
-                                extra={"requested": "%dx%d" % (w, h), "bytes": len(resp.content)})
+        # Report what actually came out, read from the file itself — this backend
+        # accepts a canvas it does not honour (1024x1024 came back 768x768).
+        actual = _image_dimensions(resp.content)
+        canvas = "%dx%d" % actual if actual else "%dx%d" % (w, h)
+
+        return success_response(
+            image=image, model=model_id, prompt=prompt, aspect_ratio=aspect,
+            provider=self.name, modality="text",
+            extra={
+                "canvas": canvas,
+                "requested_canvas": "%dx%d" % requested,
+                "canvas_source": "config" if override else "default",
+                "retried_square": downgraded,
+                # Factual, not prescriptive: did the model deliver the shape that
+                # was asked for? A "false" here almost always means this backend
+                # cannot, and the caller decides what to do about it.
+                "aspect_ratio_honored": _ratio_honored(canvas, aspect),
+                "bytes": len(resp.content),
+            })
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +635,15 @@ class AgnesProvider(ImageGenProvider):
     DEFAULT_BASE_URL = "https://apihub.agnes-ai.com/v1"
     DEFAULT_MODEL = "agnes-image-2.5-flash"
     DEFAULT_SIZE = "2K"
+
+    # Agnes expresses the canvas in two parts: a size TIER plus a RATIO. These
+    # are the tiers its API documents (1K | 2K | 3K | 4K); its ratio vocabulary
+    # is the usual 16:9 / 4:3 / 1:1 / 3:4 / 9:16 family, so the mapping below is
+    # just the Hermes aspect translated — unlike Pollinations, Agnes really can
+    # produce non-square output. Override the tier per aspect with
+    # image_gen.agnes.sizes.<aspect> (or image_gen.agnes.size for all three) and
+    # the ratio with image_gen.agnes.ratios.<aspect>.
+    SIZE_TIERS = ("1K", "2K", "3K", "4K")
 
     @property
     def name(self) -> str:
@@ -484,11 +721,29 @@ class AgnesProvider(ImageGenProvider):
         sources = sources[:4]
         modality = "image" if sources else "text"
 
-        size = _first(os.environ.get("AGNES_IMAGE_SIZE"), sub.get("size"),
+        # Canvas, part 1 — the size tier: per-aspect override > one pinned tier >
+        # the AGNES_IMAGE_SIZE env var > the adapter default. (The env var keeps
+        # working for people who already set it; config wins over it because
+        # config is the more deliberate signal.)
+        override = _canvas_from_cfg("agnes", aspect)
+        size = _first(override, os.environ.get("AGNES_IMAGE_SIZE"),
                       self.DEFAULT_SIZE) or self.DEFAULT_SIZE
         size = size.upper()
-        if size not in ("1K", "2K", "3K", "4K"):
+        if size not in self.SIZE_TIERS:
+            logger.warning("Agnes: unsupported size tier %r (want %s), using %s",
+                           size, "/".join(self.SIZE_TIERS), self.DEFAULT_SIZE)
             size = self.DEFAULT_SIZE
+
+        # Canvas, part 2 — the ratio. Agnes *can* do real 16:9 / 9:16, so this
+        # follows the requested aspect unless explicitly overridden.
+        ratio = _RATIO.get(aspect, "16:9")
+        ratio_override = False
+        ratios = sub.get("ratios")
+        if isinstance(ratios, dict):
+            configured = ratios.get(aspect)
+            if isinstance(configured, str) and configured.strip():
+                ratio = configured.strip()
+                ratio_override = True
 
         base_url = (_first(os.environ.get("AGNES_BASE_URL"), sub.get("base_url"),
                            self.DEFAULT_BASE_URL) or self.DEFAULT_BASE_URL).rstrip("/")
@@ -498,7 +753,7 @@ class AgnesProvider(ImageGenProvider):
             extra_body["image"] = sources
 
         body = {"model": model_id, "prompt": prompt, "size": size,
-                "ratio": _RATIO.get(aspect, "16:9"), "extra_body": extra_body}
+                "ratio": ratio, "extra_body": extra_body}
 
         try:
             resp = requests.post(f"{base_url}/images/generations",
@@ -548,12 +803,272 @@ class AgnesProvider(ImageGenProvider):
                 logger.warning("Could not cache Agnes image locally: %s", exc)
                 image = url
 
-        return success_response(image=image, model=model_id, prompt=prompt, aspect_ratio=aspect,
-                                provider=self.name, modality=modality,
-                                extra={"size": size, "ratio": _RATIO.get(aspect, "16:9")})
+        # Prefer the file's real dimensions; fall back to the requested tier+ratio
+        # when the image stayed remote (caching failed) or is unparsable.
+        actual = _image_dimensions(image) if isinstance(image, str) else None
+        canvas = "%dx%d" % actual if actual else "%s %s" % (size, ratio)
+
+        return success_response(
+            image=image, model=model_id, prompt=prompt, aspect_ratio=aspect,
+            provider=self.name, modality=modality,
+            extra={"canvas": canvas,
+                   "requested_canvas": "%s %s" % (size, ratio),
+                   "size": size,
+                   "ratio": ratio,
+                   "canvas_source": "config" if (override or ratio_override) else "default",
+                   "aspect_ratio_honored": _ratio_honored(canvas, aspect),
+                   "supported_size_tiers": list(self.SIZE_TIERS)})
+
+
+# ---------------------------------------------------------------------------
+# free-any — meta backend that chains the others
+# ---------------------------------------------------------------------------
+
+
+class FreeAnyProvider(ImageGenProvider):
+    """Try several backends in order and return the first image that works.
+
+    Hermes resolves exactly ONE active provider and does not fall back: a 429,
+    a 402, or a spent free quota on that backend fails the call outright. This
+    adapter supplies the missing fallback by re-dispatching to the other
+    registered providers itself.
+
+    Configure the order in ``config.yaml``::
+
+        image_gen:
+          provider: free-any
+          free-any:
+            order: [cogview, agnes, pollinations]
+
+    Names are tried left to right. Backends that are unregistered, missing
+    credentials, or that raise/return an error are skipped and recorded in the
+    response's ``attempts`` list. An explicitly passed ``model`` is forwarded to
+    every backend — a name only one of them understands still works, because the
+    others reject it and the chain moves on.
+    """
+
+    # Reliability-ordered, not preference-ordered: 智谱 is the durable free tier,
+    # Agnes is a promo that currently works, and Pollinations both refuses (402)
+    # and silently downscales, so it is the last resort rather than the first try.
+    DEFAULT_ORDER = ("cogview", "agnes", "pollinations")
+
+    @property
+    def name(self) -> str:
+        return "free-any"
+
+    @property
+    def display_name(self) -> str:
+        return "Free-Any (auto-fallback chain)"
+
+    # -- chain resolution --------------------------------------------------
+
+    @staticmethod
+    def _lookup(provider_name: str) -> Optional[ImageGenProvider]:
+        """Fetch a registered provider by name.
+
+        Imported lazily: this module is loaded by the plugin manager during
+        startup, and the registry import is not guaranteed to be safe then.
+        """
+        try:
+            from agent.image_gen_registry import get_provider
+
+            return get_provider(provider_name)
+        except Exception as exc:  # pragma: no cover
+            logger.debug("free-any: could not look up %r: %s", provider_name, exc)
+            return None
+
+    def _chain(self) -> List[str]:
+        """Resolve the configured order to the names that are really registered."""
+        # Accept ``free-any`` and ``free_any`` as the config key, and either a
+        # YAML list or a comma/space separated string.
+        raw = _sub_cfg("free-any").get("order") or _sub_cfg("free_any").get("order")
+        names: List[str] = []
+        if isinstance(raw, str):
+            # ``hermes config set image_gen.free-any.order "[a, b]"`` stores the
+            # literal STRING "[a, b]", not a YAML list — strip the brackets and
+            # quotes so that command really works. A hand-written YAML list
+            # ([a, b] unquoted) arrives as a real list and skips this branch.
+            cleaned = raw.strip().strip("[]").strip()
+            for ch in (",", "'", '"'):
+                cleaned = cleaned.replace(ch, " ")
+            raw = cleaned.split()
+        if isinstance(raw, (list, tuple)):
+            for item in raw:
+                if isinstance(item, str) and item.strip():
+                    names.append(item.strip())
+        if not names:
+            names = list(self.DEFAULT_ORDER)
+
+        chain: List[str] = []
+        for candidate in names:
+            if candidate == self.name:
+                # Guard against a self-referential chain — would recurse forever.
+                logger.warning("free-any: ignoring '%s' in its own chain", candidate)
+                continue
+            if candidate in chain:
+                continue
+            if self._lookup(candidate) is None:
+                logger.debug("free-any: '%s' is not registered, skipping", candidate)
+                continue
+            chain.append(candidate)
+        return chain
+
+    def _members(self) -> List[Tuple[str, ImageGenProvider]]:
+        """Chain entries as ``(name, provider)`` pairs, preserving order."""
+        pairs: List[Tuple[str, ImageGenProvider]] = []
+        for entry in self._chain():
+            provider = self._lookup(entry)
+            if provider is not None:
+                pairs.append((entry, provider))
+        return pairs
+
+    # -- ImageGenProvider surface -----------------------------------------
+
+    def is_available(self) -> bool:
+        """True when at least one backend in the chain can service a call."""
+        for _, provider in self._members():
+            try:
+                if provider.is_available():
+                    return True
+            except Exception:  # pragma: no cover
+                continue
+        return False
+
+    def list_models(self) -> List[Dict[str, Any]]:
+        """Union of the chain's models, each labelled with its backend."""
+        models: List[Dict[str, Any]] = []
+        seen = set()
+        for backend, provider in self._members():
+            try:
+                entries = provider.list_models() or []
+            except Exception:
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict) or not entry.get("id"):
+                    continue
+                if entry["id"] in seen:
+                    continue
+                seen.add(entry["id"])
+                merged = dict(entry)
+                merged["display"] = "%s · %s" % (entry.get("display") or entry["id"], backend)
+                models.append(merged)
+        return models
+
+    def get_setup_schema(self) -> Dict[str, Any]:
+        rows = []
+        for backend, provider in self._members():
+            try:
+                ok = bool(provider.is_available())
+            except Exception:
+                ok = False
+            rows.append("%s%s" % (backend, "" if ok else "(no key)"))
+        return {
+            "name": "Free-Any auto-fallback",
+            "badge": "chain",
+            "tag": "Tries each backend in order, first success wins: "
+                   + (" -> ".join(rows) if rows else
+                      "(chain is empty; set image_gen.free-any.order)"),
+            "env_vars": [],
+        }
+
+    def capabilities(self) -> Dict[str, Any]:
+        # The chain is as capable as its most capable member: image-to-image
+        # works whenever a backend that supports it is reachable.
+        max_refs = 0
+        for _, provider in self._members():
+            try:
+                caps = provider.capabilities() or {}
+                max_refs = max(max_refs, int(caps.get("max_reference_images") or 0))
+            except Exception:
+                continue
+        return {
+            "modalities": ["text", "image"] if max_refs else ["text"],
+            "max_reference_images": max_refs,
+        }
+
+    def generate(
+        self,
+        prompt: str,
+        aspect_ratio: str = DEFAULT_ASPECT_RATIO,
+        *,
+        image_url: Optional[str] = None,
+        reference_image_urls: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        prompt = (prompt or "").strip()
+        aspect = resolve_aspect_ratio(aspect_ratio)
+
+        if not prompt:
+            return error_response(error="Prompt is required", error_type="invalid_argument",
+                                  provider=self.name, aspect_ratio=aspect)
+
+        chain = self._chain()
+        if not chain:
+            return error_response(
+                error=("free-any has no usable backend. Set image_gen.free-any.order to a list of "
+                       "registered provider names, e.g. [cogview, pollinations]."),
+                error_type="misconfigured", provider=self.name,
+                prompt=prompt, aspect_ratio=aspect)
+
+        attempts: List[Dict[str, Any]] = []
+        for backend in chain:
+            provider = self._lookup(backend)
+            if provider is None:
+                attempts.append({"provider": backend, "skipped": "not registered"})
+                continue
+
+            try:
+                available = bool(provider.is_available())
+            except Exception as exc:
+                attempts.append({"provider": backend,
+                                 "skipped": "%s: %s" % (type(exc).__name__, exc)})
+                continue
+            if not available:
+                attempts.append({"provider": backend, "skipped": "unavailable (no credentials?)"})
+                continue
+
+            try:
+                result = provider.generate(prompt, aspect, image_url=image_url,
+                                           reference_image_urls=reference_image_urls, **kwargs)
+            except Exception as exc:
+                attempts.append({"provider": backend,
+                                 "error": "%s: %s" % (type(exc).__name__, exc)})
+                logger.warning("free-any: %s raised %s, trying next backend", backend, exc)
+                continue
+
+            if isinstance(result, dict) and result.get("success"):
+                # Pass the winning backend's response through untouched apart
+                # from chain bookkeeping, so ``provider`` keeps naming the
+                # backend that actually produced the image.
+                result["requested_provider"] = self.name
+                result["chain"] = list(chain)
+                result["attempts"] = attempts + [{"provider": backend, "ok": True}]
+                result["fallbacks_used"] = len(attempts)
+                if attempts:
+                    logger.info("free-any: served by '%s' after %d failed backend(s)",
+                                backend, len(attempts))
+                return result
+
+            detail = result.get("error") if isinstance(result, dict) else repr(result)
+            attempts.append({
+                "provider": backend,
+                "error": detail or "unknown error",
+                "error_type": result.get("error_type") if isinstance(result, dict) else None,
+            })
+            logger.warning("free-any: %s failed (%s), trying next backend", backend, detail)
+
+        summary = "; ".join(
+            "%s: %s" % (a["provider"], a.get("error") or a.get("skipped") or "failed")
+            for a in attempts
+        )
+        return error_response(
+            error="All %d backend(s) in the free-any chain failed — %s" % (len(attempts), summary),
+            error_type="all_backends_failed", provider=self.name,
+            prompt=prompt, aspect_ratio=aspect,
+        )
 
 
 def register(ctx) -> None:
-    """Plugin entry point — registers every free backend in one go."""
-    for provider in (CogViewProvider(), PollinationsProvider(), AgnesProvider()):
+    """Plugin entry point — registers every free backend, plus the fallback chain."""
+    for provider in (CogViewProvider(), PollinationsProvider(), AgnesProvider(), FreeAnyProvider()):
         ctx.register_image_gen_provider(provider)
