@@ -1,0 +1,6 @@
+name: free-image-gen
+version: 1.0.0
+description: "Free image-generation backends for Hermes: 智谱 CogView-3-Flash (permanently free), Pollinations (no API key needed), and Agnes AI (promotional $0). Registers the cogview, pollinations and agnes providers. Generated images are cached to $HERMES_HOME/cache/images/."
+author: LaoLU (lusdaily.com)
+kind: backend
+requires_env: []
